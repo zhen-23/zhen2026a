@@ -1,13 +1,14 @@
+import requests
+from bs4 import BeautifulSoup
 import os
 import json
 import firebase_admin
 from firebase_admin import credentials, firestore
-from google.cloud.firestore_v1.base_query import FieldFilter
 from flask import Flask, render_template, request
 from datetime import datetime
 import random
 
-# 1. Firebase 初始化 (支援本地與 Vercel 部署)
+# Firebase 初始化
 if os.path.exists('serviceAccountKey.json'):
     cred = credentials.Certificate('serviceAccountKey.json')
 else:
@@ -20,96 +21,116 @@ if not firebase_admin._apps:
 
 app = Flask(__name__)
 
-# --- 路由設定 ---
+# --- 【電影功能區】 ---
 
-@app.route("/")
-def index():
-    return render_template("index.html")
+@app.route("/movie")
+def movie():
+    url = "http://www.atmovies.com.tw/movie/next/"
+    Data = requests.get(url)
+    Data.encoding = "utf-8"
+    sp = BeautifulSoup(Data.text, "html.parser")
+    result = sp.select(".filmListAllX li")
+    lastUpdate = sp.find("div", class_="smaller09").text[5:] 
+
+    db = firestore.client()
+    for item in result:
+        picture = item.find("img").get("src").replace(" ", "")
+        title = item.find("div", class_="filmtitle").text
+        movie_id = item.find("div", class_="filmtitle").find("a").get("href").replace("/", "").replace("movie", "")
+        hyperlink = "http://www.atmovies.com.tw" + item.find("div", class_="filmtitle").find("a").get("href")
+        
+        show = item.find("div", class_="runtime").text.replace("上映日期：", "")
+        show = show.replace("片長：", "")
+        show = show.replace("分", "")
+        showDate = show[0:10]      
+        showLength = show[13:]     
+
+        doc = {
+            "title": title, "picture": picture, "hyperlink": hyperlink,
+            "showDate": showDate, "showLength": showLength, "lastUpdate": lastUpdate
+        }
+        db.collection("電影").document(movie_id).set(doc)
+    return "近期上映電影已爬蟲及存檔完畢，網站最近更新日期為：" + lastUpdate
+
+# 修正：讓電影查詢對應 input.html 的 MovieTitle
+@app.route("/search_movie", methods=["GET", "POST"])
+def search_movie():
+    if request.method == "POST":
+        # 這裡要跟 input.html 裡面的 name="MovieTitle" 一樣
+        movie_title = request.form.get("MovieTitle") 
+        if not movie_title:
+            return "請輸入片名！"
+            
+        db = firestore.client()
+        docs = db.collection("電影").get()
+        info = ""
+        for doc in docs:
+            data = doc.to_dict()
+            if movie_title in data.get("title", ""):
+                info += f"<h3>{data['title']}</h3>"
+                info += f"<img src='http://www.atmovies.com.tw{data['picture']}' width='200'><br>"
+                info += f"片長：{data['showLength']} 分鐘<br>"
+                info += f"上映日期：{data['showDate']}<br>"
+                info += f"<a href='{data['hyperlink']}' target='_blank'>影片介紹</a><br><hr>"
+        return info if info else "抱歉，找不到相關電影。"
+    return render_template("input.html")
+
+# --- 【老師查詢功能區】 ---
 
 @app.route("/search", methods=["GET", "POST"])
 def search():
     db = firestore.client()
     results = []
-    keyword = ""
-    
     if request.method == "POST":
-        # 使用 .strip() 避免空格導致搜尋不到
-        keyword = request.form.get("keyword").strip()
-        collection_ref = db.collection("靜宜資管2026a")
-        docs = collection_ref.get()
+        # 避免 strip() 報錯，先檢查有沒有拿到值
+        keyword = request.form.get("keyword")
+        if keyword:
+            keyword = keyword.strip()
+            collection_ref = db.collection("靜宜資管2026a")
+            docs = collection_ref.get()
+            for doc in docs:
+                user = doc.to_dict()
+                name = user.get("name", "")
+                if keyword in name:
+                    results.append({"name": name, "lab": user.get("lab", "尚未設定")})
+        return render_template("search.html", results=results, keyword=keyword)
+    return render_template("search.html", results=results)
 
-        for doc in docs:
-            user = doc.to_dict()
-            # 使用 .get 避免 KeyError，並進行關鍵字模糊比對
-            name = user.get("name", "")
-            if keyword in name:
-                results.append({
-                    "name": name,
-                    "lab": user.get("lab", "尚未設定")
-                })
-
-    return render_template("search.html", results=results, keyword=keyword)
+# --- 【原本的其他功能】 ---
 
 @app.route("/read")
 def read():
     db = firestore.client()
     temp = ""
-    collection_ref = db.collection("靜宜資管2026a")
-    # 設定跟老師一樣的順序：按 lab 數字從大到小排序，限制 4 筆
-    docs = collection_ref.order_by("lab", direction=firestore.Query.DESCENDING).limit(4).get()
-    
+    docs = db.collection("靜宜資管2026a").order_by("lab", direction=firestore.Query.DESCENDING).limit(4).get()
     for doc in docs:
         temp += str(doc.to_dict()) + "<br>"
     return temp
 
-@app.route("/mis")
-def course():
-    return "<h1>資訊管理導論</h1><a href=/>回到網站首頁</a>"
+@app.route("/")
+def index():
+    return render_template("index.html")
 
 @app.route("/today")
 def today():
     now = datetime.now()
-    now_str = f"{now.year}年{now.month}月{now.day}日"
-    return render_template("today.html", datetime=now_str)
+    return render_template("today.html", datetime=f"{now.year}年{now.month}月{now.day}日")
 
 @app.route("/me")
 def about():
-    
     return render_template("me.html")
-
-@app.route("/welcome", methods=["GET"])
-def welcome():
-    x = request.values.get("u")
-    y = request.values.get("dep")
-    return render_template("welcome.html", name=x, dep=y)
-
-@app.route("/account", methods=["GET", "POST"])
-def account():
-    if request.method == "POST":
-        user = request.form["user"]
-        pwd = request.form["pwd"]
-        return f"您輸入的帳號是：{user}; 密碼為：{pwd}"
-    return render_template("account.html")
 
 @app.route("/math", methods=["GET", "POST"])
 def math():
     if request.method == "POST":
-        x = int(request.form["x"])
-        opt = request.form["opt"]
-        y = int(request.form["y"])      
-        result = f"您輸入的是：{x}{opt}{y}"
-        
-        if opt == "/" and y == 0:
-            result += "，除數不能為0"
-        else:
-            match opt:
-                case "+": r = x + y
-                case "-": r = x - y
-                case "*": r = x * y
-                case "/": r = x / y
-                case _: return "未知運算符號"
-            result += f"={r}<br><a href=/>返回首頁</a>"          
-        return result
+        x, opt, y = int(request.form["x"]), request.form["opt"], int(request.form["y"])
+        if opt == "/" and y == 0: return "除數不能為0"
+        match opt:
+            case "+": r = x + y
+            case "-": r = x - y
+            case "*": r = x * y
+            case "/": r = x / y
+        return f"結果：{r}<br><a href='/'>返回首頁</a>"
     return render_template("math.html")
 
 @app.route('/cup', methods=["GET"])
@@ -118,32 +139,9 @@ def cup():
     result = None
     if action == 'toss':
         x1, x2 = random.randint(0, 1), random.randint(0, 1)
-        if x1 != x2:
-            msg = "聖筊：表示神明允許、同意，或行事會順利。"
-        elif x1 == 0:
-            msg = "笑筊：表示神明一笑、不解，或者考慮中，行事狀況不明。"
-        else:
-            msg = "陰筊：表示神明否定、憤怒，或者不宜行事。"
-            
-        result = {
-            "cup1": f"/static/{x1}.jpg",
-            "cup2": f"/static/{x2}.jpg",
-            "message": msg
-        }
+        msg = "聖筊" if x1 != x2 else ("笑筊" if x1 == 0 else "陰筊")
+        result = {"cup1": f"/static/{x1}.jpg", "cup2": f"/static/{x2}.jpg", "message": msg}
     return render_template('cup.html', result=result)
-
-@app.route("/math2", methods=["GET", "POST"])
-def math2():
-    result = None
-    if request.method == "POST":
-        x = int(request.form.get("x"))
-        opt = request.form.get("opt")
-        y = int(request.form.get("y"))
-        match opt:
-            case "∧": result = x ** y
-            case "√": result = x ** (1/y) if y != 0 else "數學上不存在「0 次方根」"
-            case _: result = "請輸入∧(次方)或√(根號)"
-    return render_template("math2.html", result=result)
 
 if __name__ == "__main__":
     app.run(debug=True)
